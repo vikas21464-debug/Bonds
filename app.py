@@ -92,10 +92,51 @@ def from_df(df):
     return out, skipped
 
 
+# Your goal and rules are saved inside the CSV too, so next year the app knows which ladder year it is.
+SET_COLS = ["Ladder start date", "Monthly interest goal (₹)", "Goal is after tax", "Tax rate (%)",
+            "Yearly increase (%)", "Highest coupon (%)", "Face value of one bond (₹)"]
+
+
+def _clamp(x, lo, hi, default):
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return default
+    return default if v != v else min(max(v, lo), hi)
+
+
+def read_settings(raw):
+    """Settings stored in the first row of a saved CSV, or {} if the file has none."""
+    if raw.empty or not all(c in raw.columns for c in SET_COLS):
+        return {}
+    r = raw.iloc[0]
+    try:
+        start_saved = pd.to_datetime(r[SET_COLS[0]])
+        if pd.isna(start_saved):
+            return {}
+        start_saved = start_saved.date()
+    except Exception:
+        return {}
+    if not DMIN <= start_saved <= DMAX:
+        return {}
+    return {
+        "start": start_saved,
+        "monthly": _clamp(r[SET_COLS[1]], 1000.0, 1e9, 20000.0),
+        "after_tax": str(r[SET_COLS[2]]).strip().lower() in ("true", "1", "yes"),
+        "tax": _clamp(r[SET_COLS[3]], 0.0, 45.0, 30.0),
+        "growth": _clamp(r[SET_COLS[4]], 0.0, 20.0, 6.0),
+        "cap": _clamp(r[SET_COLS[5]], 1.0, 25.0, 10.5),
+        "lot": _clamp(r[SET_COLS[6]], 100.0, 1e9, 10000.0),
+    }
+
+
 ss = st.session_state
 ss.setdefault("holdings", empty_df())
 ss.setdefault("hver", 0)      # bumped to refresh the table after the app changes it
 ss.setdefault("uver", 0)      # bumped to clear the file uploader
+ss.setdefault("settings", {})  # goal and rules loaded from a saved file
+ss.setdefault("sver", 0)      # bumped so the sidebar picks up loaded settings
+S, V = ss["settings"], ss["sver"]
 
 
 # ----------------------------------------------------------------------------
@@ -105,21 +146,26 @@ ss.setdefault("uver", 0)      # bumped to clear the file uploader
 with st.sidebar:
     st.header("Your goal and rules")
     monthly = st.number_input("Monthly interest you want in year 1 (₹)", min_value=1000.0,
-                              value=20000.0, step=1000.0)
-    basis = st.radio("This amount is", ["Before tax (gross interest)", "After tax (in hand)"])
-    tax = st.number_input("Tax rate on interest (%)", min_value=0.0, max_value=45.0,
-                          value=30.0, step=1.0) / 100
-    growth = st.number_input("Increase in interest every year (%)", min_value=0.0, max_value=20.0,
-                             value=6.0, step=0.5) / 100
-    cap = st.number_input("Highest coupon you will accept (%)", min_value=1.0, max_value=25.0,
-                          value=10.5, step=0.25) / 100
-    start = st.date_input("Ladder start date (day you buy the first 4 bonds)", value=date.today(),
-                          min_value=DMIN, max_value=DMAX,
+                              value=float(S.get("monthly", 20000.0)), step=1000.0, key=f"set_monthly_{V}")
+    basis = st.radio("This amount is", ["Before tax (gross interest)", "After tax (in hand)"],
+                     index=int(S.get("after_tax", False)), key=f"set_basis_{V}")
+    tax_pct = st.number_input("Tax rate on interest (%)", min_value=0.0, max_value=45.0,
+                              value=float(S.get("tax", 30.0)), step=1.0, key=f"set_tax_{V}")
+    growth_pct = st.number_input("Increase in interest every year (%)", min_value=0.0, max_value=20.0,
+                                 value=float(S.get("growth", 6.0)), step=0.5, key=f"set_growth_{V}")
+    cap_pct = st.number_input("Highest coupon you will accept (%)", min_value=1.0, max_value=25.0,
+                              value=float(S.get("cap", 10.5)), step=0.25, key=f"set_cap_{V}")
+    start = st.date_input("Ladder start date (day you bought / will buy the first 4 bonds)",
+                          value=S.get("start", date.today()), min_value=DMIN, max_value=DMAX,
+                          key=f"set_start_{V}",
                           help="Year 1 runs for 12 months from this date. Your interest target "
-                               "goes up by the yearly increase on each anniversary.")
-    lot = st.number_input("Face value of one bond (₹)", min_value=100.0, value=10000.0, step=100.0,
+                               "goes up by the yearly increase on each anniversary. "
+                               "Do not change it after you have started. Loading your saved file restores it.")
+    lot = st.number_input("Face value of one bond (₹)", min_value=100.0,
+                          value=float(S.get("lot", 10000.0)), step=100.0, key=f"set_lot_{V}",
                           help="Amounts are rounded up to whole bonds. Check the face value on your "
                                "platform (many NCDs are ₹1,000; some are ₹10,000 or ₹1,00,000).")
+tax, growth, cap = tax_pct / 100, growth_pct / 100, cap_pct / 100
 
 gross_monthly = monthly if basis.startswith("Before") else lad.gross_from_net(monthly, tax)
 year_today = lad.ladder_year(start, date.today())
@@ -128,6 +174,9 @@ target_today = gross_monthly * (1 + growth) ** (year_today - 1)
 st.title("🪜 Bond Ladder Planner")
 st.caption(f"Bonds maturing in 1 to {L} years. Each year the shortest one matures and you buy a new "
            f"{L}-year bond. Educational only, not investment advice.")
+
+if ss.get("notice"):
+    st.success(ss.pop("notice"))
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Year 1 interest per month (gross)", inr(gross_monthly))
@@ -204,7 +253,7 @@ with tab1:
                    "assuming you buy at par. If you pay above or below face value, use tab ② to see the money to pay.")
 
         if st.button("Use these bonds as my current ladder", disabled=bool(over), key="t1_use"):
-            ss["holdings"] = to_df([lad.Holding(names[j] or f"{j}-year bond", res.face_each, cpns[j],
+            ss["holdings"] = to_df([lad.Holding(names[j] or f"{j + 1}-year bond", res.face_each, cpns[j],
                                                 mats[j]) for j in range(L)])
             ss["hver"] += 1
             st.success("Saved. Now open tab ② to see them.")
@@ -217,7 +266,7 @@ with tab2:
     st.subheader("1. Your current bonds")
     with st.expander("Load a saved ladder"):
         up = st.file_uploader("Saved ladder (CSV)", type="csv", key=f"upload_{ss['uver']}")
-        loaded = None
+        loaded, file_settings = None, {}
         if up is not None:
             try:
                 raw = pd.read_csv(up)
@@ -229,12 +278,22 @@ with tab2:
                     loaded[COLS[1]] = pd.to_numeric(loaded[COLS[1]], errors="coerce")
                     loaded[COLS[2]] = pd.to_numeric(loaded[COLS[2]], errors="coerce")
                     loaded[COLS[3]] = pd.to_datetime(loaded[COLS[3]], errors="coerce")
+                    file_settings = read_settings(raw)
             except Exception as ex:   # unreadable file
                 st.error(f"Could not read the file: {ex}")
         if loaded is not None:
             ss["holdings"] = loaded
             ss["hver"] += 1
             ss["uver"] += 1
+            if file_settings:
+                ss["settings"] = file_settings
+                ss["sver"] += 1
+                ss["notice"] = (f"Loaded {len(loaded)} bonds and your settings: ladder started "
+                                f"{file_settings['start']:%d %b %Y}, goal {inr(file_settings['monthly'])} a month, "
+                                f"+{file_settings['growth']:.1f}% a year, coupon limit {file_settings['cap']:.2f}%.")
+            else:
+                ss["notice"] = (f"Loaded {len(loaded)} bonds. This file has no saved settings (it is from an "
+                                "older version), so check the ladder start date in the sidebar.")
             st.rerun()
 
     edited = st.data_editor(
@@ -250,11 +309,16 @@ with tab2:
     holdings, skipped = from_df(edited)
     if skipped:
         st.warning(f"{skipped} incomplete row(s) are ignored until every column is filled in.")
-    st.download_button("Save my ladder (CSV)", edited.to_csv(index=False).encode("utf-8"),
+    to_save = edited.copy()
+    for col, val in zip(SET_COLS, [start.isoformat(), monthly, basis.startswith("After"), tax_pct,
+                                   growth_pct, cap_pct, lot]):
+        to_save[col] = val
+    st.download_button("Save my ladder (CSV)", to_save.to_csv(index=False).encode("utf-8"),
                        file_name="my_bond_ladder.csv", mime="text/csv", key="dl_holdings")
     st.caption("Face value held = the face value of the bonds you own (interest = face value × coupon). "
-               "This page forgets your table when you close it or refresh, so save the CSV after every "
-               "change and load it next time.")
+               "This page forgets everything when you close it or refresh, so save the CSV after every "
+               "change and load it next time. The file also remembers your ladder start date, goal and "
+               "coupon limit, so next year the app knows which ladder year it is.")
 
     st.subheader("2. The bond you are about to buy")
     a, b, c, d = st.columns(4)
@@ -302,8 +366,9 @@ with tab2:
                      "Look for another bond. The figures below are for reference only.")
         elif not sz.needed:
             st.success(f"✅ No new bond needed. Bonds still running already pay {inr(sz.running_monthly)} "
-                       f"a month, at or above the {inr(target)} target. "
-                       f"The matured {inr(sz.matured_principal)} is free to use.")
+                       f"a month, at or above the {inr(target)} target."
+                       + (f" The matured {inr(sz.matured_principal)} is free to use."
+                          if sz.matured_principal > 0 else ""))
         else:
             st.success(f"✅ Confirmed. Invest **{inr(sz.money_to_pay)}** in this bond ({inr(sz.face)} face "
                        f"value" + (f", {sz.bonds} bonds" if sz.bonds else "") + f"). "
