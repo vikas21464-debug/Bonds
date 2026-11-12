@@ -1,14 +1,19 @@
 """
 Bond Ladder Planner - Streamlit app
 -----------------------------------
-Plan a ladder of 1, 2, 3 and 4-year bonds (equal amounts). Every year the shortest bond
-matures and the money goes into a new 4-year bond, so the ladder rolls forever.
+A ladder of 1, 2, 3 and 4-year bonds. Every year the shortest bond matures and you buy a new
+4-year bond. Your monthly interest should rise 6% a year, and you never accept a coupon above
+your limit (10.50% by default), so each new bond is bigger than the one it replaces.
 
-Tab 1: you know how much money you have  -> the coupon / YTM you need.
-Tab 2: you know the yields you can get   -> the money you need.
+Tab 1: first ladder  - type the real coupon and maturity of the 4 bonds -> how much in each.
+Tab 2: buy next bond - type the real coupon and maturity of the bond in front of you
+                       -> the amount to invest (and how much is fresh money).
+Tab 3: plan ahead    - how much money to arrange each year, at your coupon limit.
 
 Educational tool only - NOT investment advice.
 """
+
+from datetime import date
 
 import pandas as pd
 import streamlit as st
@@ -17,9 +22,13 @@ import ladder as lad
 
 st.set_page_config(page_title="Bond Ladder Planner", page_icon="🪜", layout="wide")
 
+LADDER_YEARS = 4                       # 1, 2, 3 and 4-year bonds. Edit for a different ladder.
+DMIN, DMAX = date(2000, 1, 1), date(2100, 12, 31)
+L = LADDER_YEARS
+
 
 # ----------------------------------------------------------------------------
-# Formatting helpers
+# Helpers
 # ----------------------------------------------------------------------------
 
 def inr(x):
@@ -44,241 +53,374 @@ def pct(x):
     return "—" if x is None or x != x else f"{x * 100:.2f}%"
 
 
+COLS = ["Bond / ISIN", "Face value held (₹)", "Coupon (%)", "Maturity date"]
+
+
+def empty_df():
+    return pd.DataFrame({
+        COLS[0]: pd.Series(dtype="object"),
+        COLS[1]: pd.Series(dtype="float64"),
+        COLS[2]: pd.Series(dtype="float64"),
+        COLS[3]: pd.Series(dtype="datetime64[ns]"),
+    })
+
+
+def to_df(holdings):
+    if not holdings:
+        return empty_df()
+    return pd.DataFrame({
+        COLS[0]: [h.name for h in holdings],
+        COLS[1]: [float(h.face) for h in holdings],
+        COLS[2]: [h.coupon * 100 for h in holdings],
+        COLS[3]: pd.to_datetime([h.maturity for h in holdings]),
+    })
+
+
+def from_df(df):
+    """Table -> list of Holding. Rows with a missing value are skipped (and counted)."""
+    out, skipped = [], 0
+    for _, r in df.iterrows():
+        if r.isna().all():
+            continue
+        face, cpn, mat = r[COLS[1]], r[COLS[2]], r[COLS[3]]
+        if pd.isna(face) or pd.isna(cpn) or pd.isna(mat) or face <= 0 or cpn <= 0:
+            skipped += 1
+            continue
+        name = r[COLS[0]]
+        out.append(lad.Holding("" if pd.isna(name) else str(name), float(face),
+                               float(cpn) / 100, pd.Timestamp(mat).date()))
+    return out, skipped
+
+
+ss = st.session_state
+ss.setdefault("holdings", empty_df())
+ss.setdefault("hver", 0)      # bumped to refresh the table after the app changes it
+ss.setdefault("uver", 0)      # bumped to clear the file uploader
+
+
 # ----------------------------------------------------------------------------
-# Sidebar: the goal
+# Sidebar: your rules
 # ----------------------------------------------------------------------------
 
 with st.sidebar:
-    st.header("Your goal")
+    st.header("Your goal and rules")
     monthly = st.number_input("Monthly interest you want in year 1 (₹)", min_value=1000.0,
                               value=20000.0, step=1000.0)
     basis = st.radio("This amount is", ["Before tax (gross interest)", "After tax (in hand)"])
     tax = st.number_input("Tax rate on interest (%)", min_value=0.0, max_value=45.0,
                           value=30.0, step=1.0) / 100
-    growth = st.number_input("Increase in monthly interest every year (%)", min_value=0.0,
-                             max_value=20.0, value=6.0, step=0.5) / 100
-    L = int(st.number_input("Ladder length (years)", min_value=2, max_value=10, value=4, step=1))
-    years = int(st.number_input("Years to project", min_value=3, max_value=30, value=10, step=1))
-    gsec = st.number_input("Government bond (G-Sec) yield (%)", min_value=0.0, max_value=15.0,
-                           value=7.08, step=0.05,
-                           help="Used only to say what credit quality a yield implies. "
-                                "7.08% was the 3-year G-Sec yield on 3 Nov 2026 - update it.") / 100
+    growth = st.number_input("Increase in interest every year (%)", min_value=0.0, max_value=20.0,
+                             value=6.0, step=0.5) / 100
+    cap = st.number_input("Highest coupon you will accept (%)", min_value=1.0, max_value=25.0,
+                          value=10.5, step=0.25) / 100
+    start = st.date_input("Ladder start date (day you buy the first 4 bonds)", value=date.today(),
+                          min_value=DMIN, max_value=DMAX,
+                          help="Year 1 runs for 12 months from this date. Your interest target "
+                               "goes up by the yearly increase on each anniversary.")
+    lot = st.number_input("Face value of one bond (₹)", min_value=100.0, value=10000.0, step=100.0,
+                          help="Amounts are rounded up to whole bonds. Check the face value on your "
+                               "platform (many NCDs are ₹1,000; some are ₹10,000 or ₹1,00,000).")
 
 gross_monthly = monthly if basis.startswith("Before") else lad.gross_from_net(monthly, tax)
-targets = lad.income_targets(gross_monthly, growth, years)
+year_today = lad.ladder_year(start, date.today())
+target_today = gross_monthly * (1 + growth) ** (year_today - 1)
 
 st.title("🪜 Bond Ladder Planner")
-st.caption(f"{L} equal bonds maturing in 1 to {L} years. Each year the shortest one matures and the "
-           f"money goes into a new {L}-year bond. Educational only, not investment advice.")
+st.caption(f"Bonds maturing in 1 to {L} years. Each year the shortest one matures and you buy a new "
+           f"{L}-year bond. Educational only, not investment advice.")
 
-g1, g2, g3, g4 = st.columns(4)
-g1.metric("Year 1 interest per month (gross)", inr(gross_monthly))
-g2.metric(f"Year 1 per month after {tax * 100:.0f}% tax", inr(gross_monthly * (1 - tax)))
-g3.metric(f"Year {years} interest per month (gross)", inr(targets[-1] / 12),
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Year 1 interest per month (gross)", inr(gross_monthly))
+k2.metric(f"Year 1 per month after {tax * 100:.0f}% tax", inr(gross_monthly * (1 - tax)))
+k3.metric(f"Interest target today (ladder year {year_today})", inr(target_today),
           f"+{growth * 100:.1f}% every year")
-g4.metric(f"Total interest over {years} years (gross)", inr(sum(targets)))
+k4.metric("Highest coupon you accept", pct(cap))
 
 st.info(
-    "**Key point.** A ladder earns *money invested × yield*. If yields stay flat, your interest can "
-    f"only grow {growth * 100:.0f}% a year if the money invested also grows about "
-    f"{growth * 100:.0f}% a year, or if yields keep rising. Tab ① shows the coupon you would need "
-    "without adding money. Tab ② shows how much fresh money you would need to add."
+    f"**How it works.** Because you will not accept a coupon above {cap * 100:.2f}%, your interest can only "
+    f"grow {growth * 100:.0f}% a year if each new {L}-year bond is **bigger** than the one that matured. "
+    "Enter the real coupon and maturity date of the bond you are about to buy, and the app tells you "
+    "how much to invest."
 )
 
-tab1, tab2 = st.tabs(["① I know my capital → what coupon / YTM do I need?",
-                      "② I know the yields → how much capital do I need?"])
+tab1, tab2, tab3 = st.tabs(["① Build the first ladder", "② Buy the next bond (every year)",
+                            "③ Plan ahead"])
 
 # ----------------------------------------------------------------------------
-# Tab 1: capital known -> required coupon
+# Tab 1: first ladder
 # ----------------------------------------------------------------------------
 
 with tab1:
-    a, b, c, d = st.columns(4)
-    capital = a.number_input("Money you can invest today (₹)", min_value=100000.0,
-                             value=2500000.0, step=100000.0, key="t1_capital")
-    topup_y = b.number_input("Fresh money you can add each year (₹)", min_value=0.0,
-                             value=0.0, step=10000.0, key="t1_topup")
-    slope = c.number_input(f"Yield gap: 1-year vs {L}-year bond (percentage points)", min_value=0.0,
-                           max_value=4.0, value=1.0, step=0.25, key="t1_slope",
-                           help="Shorter bonds usually pay less. 0 = same coupon on every bond.") / 100
-    cap = d.number_input(f"Highest coupon you would accept on a new {L}-year bond (%)",
-                         min_value=1.0, max_value=25.0, value=10.5, step=0.25, key="t1_cap") / 100
+    st.markdown(f"Enter the **real coupon and maturity date** of the {L} bonds you plan to buy on "
+                f"**{start:%d %b %Y}**. You get equal amounts in each, sized to give "
+                f"{inr(gross_monthly)} a month.")
+    names, cpns, mats = [], [], []
+    for j in range(1, L + 1):
+        c1, c2, c3 = st.columns([2, 1, 1])
+        names.append(c1.text_input(f"{j}-year bond: name / ISIN (optional)", key=f"t1_n{j}"))
+        cpns.append(c2.number_input(f"{j}-year bond: coupon (%)", min_value=1.0, max_value=25.0,
+                                    value=float(min(8.0 + 0.5 * (j - 1), cap * 100)), step=0.05,
+                                    key=f"t1_c{j}") / 100)
+        mats.append(c3.date_input(f"{j}-year bond: maturity date", value=lad.add_years(start, j),
+                                  min_value=DMIN, max_value=DMAX, key=f"t1_m{j}_{start.isoformat()}"))
+    st.caption("The coupons shown are only examples. Replace them with what is actually on offer.")
 
-    avg, coupons, rows, _ = lad.plan_for_capital(L, years, targets, capital,
-                                                 [topup_y] * (years - 1), slope)
-    label, spread_bps, risk = lad.typical_rating(avg, gsec)
+    over = [f"{j}-year ({cpns[j - 1] * 100:.2f}%)" for j in range(1, L + 1) if cpns[j - 1] > cap + 1e-9]
+    early = [str(j) + "-year" for j in range(1, L + 1) if mats[j - 1] <= start]
+    odd = [f"{j}-year bond matures in {(mats[j - 1] - start).days / 365.25:.1f} years"
+           for j in range(1, L + 1) if mats[j - 1] > start and abs((mats[j - 1] - start).days / 365.25 - j) > 0.5]
 
-    st.subheader("Today's purchase")
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Average coupon / YTM you need", pct(avg))
-    m2.metric("Spread over G-Sec", f"{spread_bps:.0f} bps")
-    m3.metric("Typical rating at that yield", f"{label} ({risk} risk)")
-
-    if avg > 0.14:
-        st.error("This yield is only available from very risky issuers. A ladder built on it can lose "
-                 "far more to defaults than it earns. Invest more money or lower the monthly target.")
-    elif risk == "high":
-        st.warning("This return needs bonds with real default risk (BBB+ or lower). Spread each rung "
-                   "over several issuers, or consider investing more money or lowering the target.")
-    elif risk == "moderate":
-        st.info("This return is typical of A-category bonds. They carry some credit risk, so use "
-                "several issuers per rung rather than one.")
+    if early:
+        st.error(f"Maturity date must be after {start:%d %b %Y} for: {', '.join(early)}.")
     else:
-        st.success("This return is available from higher-rated bonds (AA- or better).")
-    st.caption("Rating hint is a rough rule of thumb. Real spreads vary a lot by issuer and market mood.")
-
-    per = capital / L
-    buy = pd.DataFrame({
-        "Bond": [f"{j}-year" for j in range(1, L + 1)] + ["Total"],
-        "Amount": [inr(per)] * L + [inr(capital)],
-        "Coupon / YTM needed": [pct(x) for x in coupons] + [pct(avg) + " (average)"],
-        "Monthly interest": [inr(per * x / 12) for x in coupons] + [inr(sum(per * x / 12 for x in coupons))],
-    })
-    st.dataframe(buy, hide_index=True)
-    st.caption("Only the average matters. Aim for lower coupons on the 1-year bond and higher on the "
-               "longest, as long as the average comes out at or above the figure above.")
-
-    st.subheader("Year by year: coupon needed on each new bond")
-    first_bad, tbl = None, []
-    for r in rows:
-        y = r["year"]
-        flag = ""
-        if y > 1:
-            bad = r["new_coupon"] > cap + 1e-12
-            if bad and first_bad is None:
-                first_bad = y
-            flag = "❌ above your limit" if bad else "✅ within your limit"
-        tbl.append({
-            "Year": y,
-            "Monthly interest (gross)": inr(r["income"] / 12),
-            "After tax": inr(r["income"] / 12 * (1 - tax)),
-            "Money put in": inr(r["fresh"]),
-            "New bond size": inr(r["new_principal"]) if y > 1 else "—",
-            "Coupon needed on new bond": pct(r["new_coupon"]) if y > 1 else "—",
-            "Within your limit?": flag,
-        })
-    st.dataframe(pd.DataFrame(tbl), hide_index=True)
-
-    if first_bad is None:
-        st.success(f"Every new {L}-year bond needs at most {cap * 100:.2f}%, within your limit.")
-    else:
-        worst = max(r["new_coupon"] for r in rows[1:])
-        if topup_y > 0:
-            reason = (f"Even with {inr(topup_y)} of fresh money a year, interest cannot keep growing "
-                      f"{growth * 100:.0f}% a year. Add more fresh money (see below and tab ②), "
-                      "lower the growth, or lower the target.")
+        res = lad.size_initial_ladder(gross_monthly, cpns, lot)
+        if over:
+            st.error(f"❌ Not confirmed. Coupon above your {cap * 100:.2f}% limit: {', '.join(over)}. "
+                     "Pick a different bond for that step. The amounts below are for reference only.")
         else:
-            reason = (f"Interest cannot keep growing {growth * 100:.0f}% a year from coupons alone. "
-                      "Add fresh money (see below and tab ②), lower the growth, or lower the target.")
-        st.warning(f"From year {first_bad} the new {L}-year bond would need more than your "
-                   f"{cap * 100:.2f}% limit, reaching **{worst * 100:.1f}%** by year {years}. {reason}")
+            st.success(f"✅ Confirmed. Buy **{res.bonds_each} bonds ({inr(res.face_each)}) in each** of the "
+                       f"{L} steps, {inr(res.total_face)} in all, for {inr(res.monthly_total)} of interest "
+                       "a month.")
+        if odd:
+            st.warning("Check the maturities: " + "; ".join(odd) + f". The ladder expects about 1 to {L} years.")
 
-    chart = pd.DataFrame({
-        "Coupon needed on each new bond (%)": [r["new_coupon"] * 100 for r in rows[1:]],
-        "Your limit (%)": [cap * 100] * (years - 1),
-    }, index=pd.Index([r["year"] for r in rows[1:]], name="Year"))
-    st.line_chart(chart)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Put in each bond", inr(res.face_each))
+        m2.metric("Total to invest", inr(res.total_face))
+        m3.metric("Monthly interest (gross)", inr(res.monthly_total))
+        m4.metric("After tax", inr(res.monthly_total * (1 - tax)))
 
-    st.subheader(f"What if new bonds can pay at most {cap * 100:.2f}%?")
-    rows_cap, _ = lad.simulate(L, years, targets, capital / L, coupons, new_coupons=[cap] * (years - 1))
-    cap_tbl = pd.DataFrame([{
-        "Year": r["year"],
-        "Fresh money needed": inr(r["fresh"]),
-        "New bond size": inr(r["new_principal"]),
-        "Total money invested": inr(r["capital"]),
-    } for r in rows_cap[1:]])
-    st.dataframe(cap_tbl, hide_index=True)
-    total_fresh = sum(r["fresh"] for r in rows_cap[1:])
-    st.caption(f"Total fresh money over {years - 1} years: **{inr(total_fresh)}** "
-               f"(about {inr(total_fresh / (years - 1))} a year). A negative number means money you "
-               "could take out.")
+        table = pd.DataFrame({
+            "Step": [f"{j}-year" for j in range(1, L + 1)] + ["Total"],
+            "Bond": [n or "—" for n in names] + [""],
+            "Coupon": [pct(c) for c in cpns] + [""],
+            "Maturity": [m.strftime("%d %b %Y") for m in mats] + [""],
+            "Bonds to buy": [str(res.bonds_each)] * L + [str(res.bonds_each * L)],
+            "Face value": [inr(res.face_each)] * L + [inr(res.total_face)],
+            "Monthly interest": [inr(x) for x in res.monthly_each] + [inr(res.monthly_total)],
+        })
+        st.dataframe(table, hide_index=True)
+        st.caption(f"Exact amount before rounding: {inr(res.face_each_exact)} each. Amounts are face values, "
+                   "assuming you buy at par. If you pay above or below face value, use tab ② to see the money to pay.")
 
-    raw1 = pd.DataFrame(rows).rename(columns={
-        "year": "Year", "target": "Target annual interest", "income": "Annual interest",
-        "capital": "Money invested", "fresh": "Money put in", "matured": "Matured principal",
-        "new_principal": "New bond size", "new_coupon": "Coupon needed", "avg_yield": "Portfolio yield"})
-    st.download_button("Download this plan (CSV)", raw1.to_csv(index=False).encode("utf-8"),
-                       file_name="bond_ladder_required_coupon.csv", mime="text/csv", key="dl_t1")
+        if st.button("Use these bonds as my current ladder", disabled=bool(over), key="t1_use"):
+            ss["holdings"] = to_df([lad.Holding(names[j] or f"{j}-year bond", res.face_each, cpns[j],
+                                                mats[j]) for j in range(L)])
+            ss["hver"] += 1
+            st.success("Saved. Now open tab ② to see them.")
 
 # ----------------------------------------------------------------------------
-# Tab 2: yields known -> capital needed
+# Tab 2: buy the next bond
 # ----------------------------------------------------------------------------
 
 with tab2:
-    st.markdown("Enter the yields you can realistically get (bought at face value, so coupon = YTM). "
-                "These defaults are only illustrative. Replace them with real quotes from your bond platform.")
-    cols = st.columns(L)
-    init_y = []
-    for j in range(1, L + 1):
-        default = min(8.0 + 0.5 * (j - 1), 14.0)
-        init_y.append(cols[j - 1].number_input(f"{j}-year bond (%)", min_value=1.0, max_value=25.0,
-                                               value=default, step=0.1, key=f"t2_y{j}") / 100)
+    st.subheader("1. Your current bonds")
+    with st.expander("Load a saved ladder"):
+        up = st.file_uploader("Saved ladder (CSV)", type="csv", key=f"upload_{ss['uver']}")
+        loaded = None
+        if up is not None:
+            try:
+                raw = pd.read_csv(up)
+                missing = [c for c in COLS if c not in raw.columns]
+                if missing:
+                    st.error("This file is missing columns: " + ", ".join(missing))
+                else:
+                    loaded = raw[COLS].copy()
+                    loaded[COLS[1]] = pd.to_numeric(loaded[COLS[1]], errors="coerce")
+                    loaded[COLS[2]] = pd.to_numeric(loaded[COLS[2]], errors="coerce")
+                    loaded[COLS[3]] = pd.to_datetime(loaded[COLS[3]], errors="coerce")
+            except Exception as ex:   # unreadable file
+                st.error(f"Could not read the file: {ex}")
+        if loaded is not None:
+            ss["holdings"] = loaded
+            ss["hver"] += 1
+            ss["uver"] += 1
+            st.rerun()
+
+    edited = st.data_editor(
+        ss["holdings"], key=f"holdings_editor_{ss['hver']}", num_rows="dynamic", hide_index=True,
+        column_config={
+            COLS[0]: st.column_config.TextColumn(COLS[0]),
+            COLS[1]: st.column_config.NumberColumn(COLS[1], min_value=0, step=10000, format="%d"),
+            COLS[2]: st.column_config.NumberColumn(COLS[2], min_value=0.0, max_value=30.0, step=0.05,
+                                                   format="%.2f"),
+            COLS[3]: st.column_config.DateColumn(COLS[3], min_value=DMIN, max_value=DMAX,
+                                                 format="DD MMM YYYY"),
+        })
+    holdings, skipped = from_df(edited)
+    if skipped:
+        st.warning(f"{skipped} incomplete row(s) are ignored until every column is filled in.")
+    st.download_button("Save my ladder (CSV)", edited.to_csv(index=False).encode("utf-8"),
+                       file_name="my_bond_ladder.csv", mime="text/csv", key="dl_holdings")
+    st.caption("Face value held = the face value of the bonds you own (interest = face value × coupon). "
+               "This page forgets your table when you close it or refresh, so save the CSV after every "
+               "change and load it next time.")
+
+    st.subheader("2. The bond you are about to buy")
+    a, b, c, d = st.columns(4)
+    on = a.date_input("Purchase date", value=date.today(), min_value=DMIN, max_value=DMAX, key="t2_on")
+    new_name = b.text_input("Bond name / ISIN (optional)", key="t2_name")
+    new_cpn = c.number_input("Coupon available (%)", min_value=0.5, max_value=25.0, value=10.0,
+                             step=0.05, key="t2_cpn") / 100
+    new_mat = d.date_input("Maturity date of this bond", value=lad.add_years(date.today(), L),
+                           min_value=DMIN, max_value=DMAX, key="t2_mat")
     e, f = st.columns(2)
-    new_y = e.number_input(f"Coupon on future {L}-year bonds (%)", min_value=1.0, max_value=25.0,
-                           value=9.5, step=0.1, key="t2_new") / 100
-    drift = f.number_input("Change in that coupon every year (percentage points)", min_value=-2.0,
-                           max_value=2.0, value=0.0, step=0.1, key="t2_drift") / 100
-    new_list = [max(0.005, new_y + drift * i) for i in range(years - 1)]
+    price = e.number_input("Price you will pay (% of face value)", min_value=50.0, max_value=150.0,
+                           value=100.0, step=0.25, key="t2_price",
+                           help="100 = at face value. Bonds bought in the market can cost a little more or "
+                                "less. Interest is paid on face value, so a lower price means less money.")
+    year_override = f.number_input("Ladder year to size for (0 = automatic)", min_value=0, max_value=60,
+                                   value=0, step=1, key="t2_year",
+                                   help="Year 1 is the first 12 months after the start date. Your first "
+                                        "new 4-year bond is bought in year 2. Leave 0 to work it out "
+                                        "from the dates.")
 
-    per2, rows2, _ = lad.plan_for_yields(L, years, targets, init_y, new_list)
-    cap0 = rows2[0]["capital"]
-    avg_y = sum(init_y) / L
-    label2, spread2, risk2 = lad.typical_rating(avg_y, gsec)
-    fresh_list = [r["fresh"] for r in rows2[1:]]
-    cap_end = rows2[-1]["capital"]
+    year_n = int(year_override) or lad.ladder_year(start, on)
+    target = gross_monthly * (1 + growth) ** (year_n - 1)
+    st.caption(f"Purchase on {on:%d %b %Y} is in **ladder year {year_n}**, so your interest target is "
+               f"**{inr(target)} a month** ({inr(target * (1 - tax))} after tax).")
 
-    st.subheader("Money you need")
-    n1, n2, n3, n4 = st.columns(4)
-    n1.metric("Money needed today", inr(cap0))
-    n2.metric("Average yield today", pct(avg_y))
-    n3.metric("Fresh money needed per year (average)", inr(sum(fresh_list) / len(fresh_list)))
-    n4.metric(f"Money invested in year {years}", inr(cap_end),
-              f"{(cap_end / cap0 - 1) * 100:+.0f}% vs today", delta_color="inverse")
-    st.caption(f"That average yield is about {spread2:.0f} bps over the G-Sec, typical of {label2}-rated "
-               f"bonds ({risk2} credit risk). Rough rule of thumb only.")
+    st.subheader("3. How much to invest")
+    if not holdings:
+        st.info("Add your current bonds above first (or build the first ladder in tab ①).")
+    elif new_mat <= on:
+        st.error("The maturity date must be after the purchase date.")
+    else:
+        sz = lad.size_new_bond(target, holdings, on, new_cpn, price, lot)
+        tenor = (new_mat - on).days / 365.25
+        if abs(tenor - L) > 0.5:
+            st.warning(f"This bond matures in {tenor:.1f} years. Your ladder expects a {L}-year bond, "
+                       "so check the maturity date.")
+        matured = [h for h in holdings if h.maturity <= on]
+        if matured:
+            st.caption("Matured by the purchase date (principal back, removed when you add the new bond): "
+                       + "; ".join(f"{h.name or 'bond'} {inr(h.face)}" for h in matured))
 
-    buy2 = pd.DataFrame({
-        "Bond": [f"{j}-year" for j in range(1, L + 1)] + ["Total"],
-        "Amount": [inr(per2)] * L + [inr(cap0)],
-        "Coupon / YTM": [pct(x) for x in init_y] + [pct(avg_y) + " (average)"],
-        "Monthly interest": [inr(per2 * x / 12) for x in init_y] + [inr(sum(per2 * x / 12 for x in init_y))],
-    })
-    st.dataframe(buy2, hide_index=True)
+        over_cap = new_cpn > cap + 1e-9
+        if over_cap:
+            st.error(f"❌ Not confirmed. The coupon {pct(new_cpn)} is above your {cap * 100:.2f}% limit. "
+                     "Look for another bond. The figures below are for reference only.")
+        elif not sz.needed:
+            st.success(f"✅ No new bond needed. Bonds still running already pay {inr(sz.running_monthly)} "
+                       f"a month, at or above the {inr(target)} target. "
+                       f"The matured {inr(sz.matured_principal)} is free to use.")
+        else:
+            st.success(f"✅ Confirmed. Invest **{inr(sz.money_to_pay)}** in this bond ({inr(sz.face)} face "
+                       f"value" + (f", {sz.bonds} bonds" if sz.bonds else "") + f"). "
+                       f"Of that, {inr(sz.matured_principal)} comes from matured bonds and "
+                       f"**{inr(sz.fresh_money)}** is fresh money."
+                       if sz.fresh_money >= 0 else
+                       f"✅ Confirmed. Invest **{inr(sz.money_to_pay)}** in this bond ({inr(sz.face)} face "
+                       f"value). That is less than the {inr(sz.matured_principal)} that came back, so "
+                       f"{inr(-sz.fresh_money)} is free to take out.")
 
-    st.subheader("Year by year: fresh money needed")
-    tbl2 = [{
-        "Year": r["year"],
-        "Monthly interest (gross)": inr(r["income"] / 12),
-        "After tax": inr(r["income"] / 12 * (1 - tax)),
-        "Fresh money needed": inr(r["fresh"]) if r["year"] > 1 else inr(r["fresh"]) + " (start)",
-        "New bond size": inr(r["new_principal"]) if r["year"] > 1 else "—",
-        "Coupon on new bond": pct(r["new_coupon"]) if r["year"] > 1 else "—",
-        "Total money invested": inr(r["capital"]),
-    } for r in rows2]
-    st.dataframe(pd.DataFrame(tbl2), hide_index=True)
-    st.caption("Fresh money = new bond size minus the principal that just matured. "
-               "A negative number means money you could take out.")
+        if sz.needed:
+            n1, n2, n3, n4 = st.columns(4)
+            n1.metric("Invest in this bond", inr(sz.money_to_pay))
+            n2.metric("Face value to buy", inr(sz.face))
+            n3.metric("From matured bonds", inr(sz.matured_principal))
+            n4.metric("Fresh money to add" if sz.fresh_money >= 0 else "Money you can take out",
+                      inr(abs(sz.fresh_money)))
+            steps = pd.DataFrame([
+                (f"Interest target (ladder year {year_n})", f"{inr(sz.target_monthly)} a month"),
+                ("Interest from bonds still running", f"{inr(sz.running_monthly)} a month"),
+                ("Interest still needed from the new bond", f"{inr(sz.shortfall_monthly)} a month"),
+                (f"Face value needed at {pct(new_cpn)}", inr(sz.face_exact)),
+                (f"Rounded up to whole bonds of {inr(lot)}", f"{sz.bonds} bonds = {inr(sz.face)}"),
+                (f"Money to pay at {price:.2f}% of face value", inr(sz.money_to_pay)),
+                ("Principal back from matured bonds", inr(sz.matured_principal)),
+                ("Fresh money to add (negative = money freed)", inr(sz.fresh_money)),
+                ("Monthly interest after buying", f"{inr(sz.monthly_after)} a month"),
+            ], columns=["Step", "Amount"])
+            st.dataframe(steps, hide_index=True)
+            if price != 100.0:
+                st.caption(f"At {price:.2f}% of face value, the interest on your money is "
+                           f"about {new_cpn / (price / 100) * 100:.2f}% a year.")
 
-    st.bar_chart(pd.DataFrame({"Fresh money needed (₹)": fresh_list},
-                              index=pd.Index([r["year"] for r in rows2[1:]], name="Year")))
+            if not over_cap and st.button("✅ I bought it: add it to my ladder", key="t2_add"):
+                kept = [h for h in holdings if h.maturity > on]
+                kept.append(lad.Holding(new_name or f"{L}-year bond", sz.face, new_cpn, new_mat))
+                ss["holdings"] = to_df(kept)
+                ss["hver"] += 1
+                st.rerun()
+            st.caption("The button removes bonds that have matured and adds this one. Edit the table above "
+                       "if you bought a different amount, then save the CSV.")
 
-    no_fresh = lad.income_without_fresh_money(L, years, per2, init_y, new_list)
-    st.subheader("Reality check: what if you add no fresh money?")
-    cmp_df = pd.DataFrame({
-        "Target (₹ / month)": [t / 12 for t in targets],
-        "Without fresh money (₹ / month)": [x / 12 for x in no_fresh],
-    }, index=pd.Index(range(1, years + 1), name="Year"))
-    st.line_chart(cmp_df)
-    shortfall = targets[-1] / 12 - no_fresh[-1] / 12
-    st.caption(f"With no fresh money, year {years} interest would be {inr(no_fresh[-1] / 12)} a month, "
-               f"{inr(shortfall)} short of the {inr(targets[-1] / 12)} target.")
+        # Ladder after this purchase
+        after = [h for h in holdings if h.maturity > on]
+        if sz.needed and not over_cap:
+            after = after + [lad.Holding(new_name or "New bond", sz.face, new_cpn, new_mat)]
+        if after:
+            st.subheader("4. Your ladder after this purchase")
+            after = sorted(after, key=lambda h: h.maturity)
+            ladder_tbl = pd.DataFrame({
+                "Bond": [h.name or "—" for h in after] + ["Total"],
+                "Face value": [inr(h.face) for h in after] + [inr(sum(h.face for h in after))],
+                "Coupon": [pct(h.coupon) for h in after] + [""],
+                "Matures": [h.maturity.strftime("%d %b %Y") for h in after] + [""],
+                "Time left": [f"{(h.maturity - on).days / 365.25:.1f} yrs" for h in after] + [""],
+                "Monthly interest": [inr(h.monthly_interest) for h in after]
+                                    + [inr(sum(h.monthly_interest for h in after))],
+            })
+            st.dataframe(ladder_tbl, hide_index=True)
+            nxt = after[0]
+            next_target = gross_monthly * (1 + growth) ** year_n
+            st.info(f"Next bond to mature: **{nxt.name or 'bond'}** on {nxt.maturity:%d %b %Y} "
+                    f"({inr(nxt.face)} back, {inr(nxt.monthly_interest)} a month of interest lost). "
+                    f"Plan your next purchase then. The target will be about {inr(next_target)} a month.")
 
-    raw2 = pd.DataFrame(rows2).rename(columns={
-        "year": "Year", "target": "Target annual interest", "income": "Annual interest",
-        "capital": "Money invested", "fresh": "Fresh money", "matured": "Matured principal",
-        "new_principal": "New bond size", "new_coupon": "Coupon on new bond", "avg_yield": "Portfolio yield"})
-    st.download_button("Download this plan (CSV)", raw2.to_csv(index=False).encode("utf-8"),
-                       file_name="bond_ladder_capital_needed.csv", mime="text/csv", key="dl_t2")
+            last = max(h.maturity for h in after)
+            n_months = min(60, (last.year - on.year) * 12 + last.month - on.month + 1)
+            series = lad.monthly_interest_series(after, on, n_months)
+            st.caption("Monthly interest if you buy nothing else (it steps down as bonds mature):")
+            st.bar_chart(pd.DataFrame({"Monthly interest (₹)": [v for _, v in series]},
+                                      index=pd.DatetimeIndex([pd.Timestamp(d) for d, _ in series],
+                                                             name="Month")))
+
+# ----------------------------------------------------------------------------
+# Tab 3: plan ahead
+# ----------------------------------------------------------------------------
+
+with tab3:
+    st.markdown("How much money to arrange each year. Every bond is assumed to pay the same coupon. "
+                "**Lower coupons mean you need more money**, so the second case shows a weaker market.")
+    a, b, c = st.columns(3)
+    c_hi = a.number_input("Coupon on your bonds: best case (%)", min_value=1.0, max_value=25.0,
+                          value=float(cap * 100), step=0.25, key=f"t3_hi_{cap:.4f}") / 100
+    c_lo = b.number_input("Coupon on your bonds: weaker case (%)", min_value=1.0, max_value=25.0,
+                          value=float(max(1.0, cap * 100 - 1.0)), step=0.25, key=f"t3_lo_{cap:.4f}") / 100
+    yrs = int(c.number_input("Years to plan", min_value=3, max_value=30, value=10, step=1, key="t3_years"))
+    if max(c_hi, c_lo) > cap + 1e-9:
+        st.warning(f"A coupon above your {cap * 100:.2f}% limit is not allowed by your rule.")
+
+    tg = lad.income_targets(gross_monthly, growth, yrs)
+    p_hi, rows_hi, _ = lad.plan_for_yields(L, yrs, tg, [c_hi] * L, [c_hi] * (yrs - 1))
+    p_lo, rows_lo, _ = lad.plan_for_yields(L, yrs, tg, [c_lo] * L, [c_lo] * (yrs - 1))
+
+    st.subheader("Money to arrange")
+    q1, q2, q3, q4 = st.columns(4)
+    q1.metric(f"Start with ({pct(c_hi)} coupons)", inr(rows_hi[0]["capital"]))
+    q2.metric(f"Start with ({pct(c_lo)} coupons)", inr(rows_lo[0]["capital"]))
+    q3.metric(f"Fresh money a year ({pct(c_hi)})", inr(sum(r["fresh"] for r in rows_hi[1:]) / (yrs - 1)))
+    q4.metric(f"Fresh money a year ({pct(c_lo)})", inr(sum(r["fresh"] for r in rows_lo[1:]) / (yrs - 1)))
+
+    tbl = pd.DataFrame([{
+        "Year": h["year"],
+        "Monthly interest (gross)": inr(h["income"] / 12),
+        "After tax": inr(h["income"] / 12 * (1 - tax)),
+        f"Fresh money ({pct(c_hi)})": inr(h["fresh"]) + (" (start)" if h["year"] == 1 else ""),
+        f"Total invested ({pct(c_hi)})": inr(h["capital"]),
+        f"Fresh money ({pct(c_lo)})": inr(lo["fresh"]) + (" (start)" if lo["year"] == 1 else ""),
+        f"Total invested ({pct(c_lo)})": inr(lo["capital"]),
+    } for h, lo in zip(rows_hi, rows_lo)])
+    st.dataframe(tbl, hide_index=True)
+    st.caption("When every bond pays the same coupon, interest equals money invested × coupon, so your money "
+               f"invested has to grow {growth * 100:.0f}% a year too. Real bonds will differ, so use tab ② "
+               "for each actual purchase.")
+    st.bar_chart(pd.DataFrame({
+        f"Fresh money at {pct(c_hi)} (₹)": [r["fresh"] for r in rows_hi[1:]],
+        f"Fresh money at {pct(c_lo)} (₹)": [r["fresh"] for r in rows_lo[1:]],
+    }, index=pd.Index([r["year"] for r in rows_hi[1:]], name="Year")))
 
 # ----------------------------------------------------------------------------
 # Notes
@@ -286,14 +428,14 @@ with tab2:
 
 with st.expander("Assumptions and limits"):
     st.markdown("""
-- Every bond is bought at **face value** and held to maturity, so coupon = YTM. If you pay a premium, your
-  income per rupee is lower than the coupon.
-- Bonds pay interest **monthly**. Bonds paying yearly or quarterly will make your monthly income lumpy.
-- The new bond is bought on the day the old one matures, once a year. Real maturities rarely line up exactly.
-- Coupons are **not reinvested**: you spend the interest. No defaults, no rating changes, no costs.
+- Interest is paid **monthly** on the **face value** you hold. Bonds paying yearly or quarterly make your
+  monthly income lumpy.
+- A bond counts as matured on its maturity date. Its interest stops and its face value comes back.
+- Amounts are rounded **up** to whole bonds, so interest lands at or slightly above the target.
+- Prices: the money you pay is face value × price. Accrued interest, brokerage and taxes on purchase are not
+  included.
 - Tax is a flat rate on interest. TDS rules, slabs and surcharge are not modelled.
-- Rupee amounts are shown in nominal terms. A 6% yearly rise roughly keeps pace with inflation.
-- The rating hint uses a rough table of typical spreads over G-Secs. Real spreads vary a lot.
-- **Credit risk is the real risk.** High coupons come from weaker issuers. Spread each rung over several
-  issuers and check ratings before buying. This is not investment advice.
+- No defaults or rating changes are modelled. **Credit risk is the real risk.** Spread each step over several
+  issuers and check the rating before buying. This is not investment advice.
+- The page does not remember your bonds after you close it. Use **Save my ladder (CSV)** in tab ②.
 """)
