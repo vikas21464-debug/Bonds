@@ -14,7 +14,10 @@ Model
 
 from __future__ import annotations
 
+import calendar
+import math
 from dataclasses import dataclass
+from datetime import date
 from typing import Dict, List, Optional, Sequence, Tuple
 
 NAN = float("nan")
@@ -209,4 +212,125 @@ def income_without_fresh_money(
             matured_p = sum(b.principal for b in bonds if b.end == year)
             bonds.append(Bond(year, year + length, matured_p, new_coupons[year - 2]))
         out.append(sum(b.annual_income for b in bonds if b.active_in(year)))
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Real purchases: actual bonds, actual coupons, actual dates
+# ----------------------------------------------------------------------------
+
+def add_months(d: date, n: int) -> date:
+    y, m = divmod(d.month - 1 + n, 12)
+    year, month = d.year + y, m + 1
+    return date(year, month, min(d.day, calendar.monthrange(year, month)[1]))
+
+
+def add_years(d: date, n: int) -> date:
+    return add_months(d, 12 * n)
+
+
+def ladder_year(start: date, on: date) -> int:
+    """Ladder year on a date: 1 for the first 12 months after `start`, 2 for the next 12, ..."""
+    full = on.year - start.year - ((on.month, on.day) < (start.month, start.day))
+    return max(1, full + 1)
+
+
+@dataclass
+class Holding:
+    """A bond you hold. `face` is the face value held; interest = face * coupon."""
+    name: str
+    face: float
+    coupon: float       # fraction
+    maturity: date
+
+    @property
+    def monthly_interest(self) -> float:
+        return self.face * self.coupon / 12.0
+
+
+@dataclass
+class Sizing:
+    target_monthly: float        # interest wanted per month
+    running_monthly: float       # interest from bonds still running after the purchase date
+    matured_principal: float     # face value of bonds that have matured (money back)
+    shortfall_monthly: float     # interest the new bond must supply
+    needed: bool                 # False if the running bonds already meet the target
+    face_exact: float            # face value that supplies the shortfall exactly
+    bonds: int                   # whole bonds to buy (0 if no lot size was given)
+    face: float                  # face value to buy, rounded up to whole bonds
+    money_to_pay: float          # face * price / 100
+    fresh_money: float           # money_to_pay - matured_principal (negative = money released)
+    monthly_after: float         # monthly interest after buying
+
+
+def _round_up_to_lot(face_exact: float, lot: float) -> Tuple[int, float]:
+    if lot and lot > 0:
+        bonds = max(1, math.ceil(face_exact / lot - 1e-9))
+        return bonds, bonds * lot
+    return 0, face_exact
+
+
+def size_new_bond(
+    target_monthly: float,
+    holdings: Sequence[Holding],
+    on: date,
+    coupon: float,
+    price_pct: float = 100.0,
+    lot: float = 0.0,
+) -> Sizing:
+    """
+    How much to put in the new bond so that monthly interest reaches the target.
+
+    Bonds maturing on or before `on` count as matured (principal back, no more interest);
+    the rest keep paying. The new bond must supply whatever interest is still missing.
+    """
+    if coupon <= 0:
+        raise ValueError("coupon must be positive")
+    if price_pct <= 0:
+        raise ValueError("price must be positive")
+    running = [h for h in holdings if h.maturity > on]
+    matured = [h for h in holdings if h.maturity <= on]
+    running_monthly = sum(h.monthly_interest for h in running)
+    matured_principal = sum(h.face for h in matured)
+    shortfall = target_monthly - running_monthly
+
+    if shortfall <= 0.01:       # already at or above target
+        return Sizing(target_monthly, running_monthly, matured_principal, shortfall, False,
+                      0.0, 0, 0.0, 0.0, -matured_principal, running_monthly)
+
+    face_exact = shortfall * 12.0 / coupon
+    bonds, face = _round_up_to_lot(face_exact, lot)
+    money = face * price_pct / 100.0
+    return Sizing(target_monthly, running_monthly, matured_principal, shortfall, True,
+                  face_exact, bonds, face, money, money - matured_principal,
+                  running_monthly + face * coupon / 12.0)
+
+
+@dataclass
+class InitialLadder:
+    face_each_exact: float
+    bonds_each: int
+    face_each: float
+    monthly_each: List[float]
+    total_face: float
+    monthly_total: float
+
+
+def size_initial_ladder(target_monthly: float, coupons: Sequence[float], lot: float = 0.0) -> InitialLadder:
+    """Equal face value in every rung so that year-1 monthly interest reaches the target."""
+    total_coupon = sum(coupons)
+    if total_coupon <= 0:
+        raise ValueError("coupons must be positive")
+    exact = target_monthly * 12.0 / total_coupon
+    bonds, face = _round_up_to_lot(exact, lot)
+    monthly = [face * c / 12.0 for c in coupons]
+    return InitialLadder(exact, bonds, face, monthly, face * len(coupons), sum(monthly))
+
+
+def monthly_interest_series(holdings: Sequence[Holding], on: date, months: int) -> List[Tuple[date, float]]:
+    """Monthly interest in each of the next `months` months if you buy nothing else."""
+    out = []
+    for k in range(months):
+        d = add_months(on, k)
+        out.append((d, sum(h.monthly_interest for h in holdings if h.maturity > d)))
     return out
