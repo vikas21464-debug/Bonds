@@ -18,6 +18,7 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
+import fetcher as fch
 import ladder as lad
 
 st.set_page_config(page_title="Bond Ladder Planner", page_icon="🪜", layout="wide")
@@ -199,12 +200,74 @@ tab1, tab2, tab3 = st.tabs(["① Build the first ladder", "② Buy the next bond
 # Tab 1: first ladder
 # ----------------------------------------------------------------------------
 
+
+# ----------------------------------------------------------------------------
+# ISIN lookup box: fills coupon and maturity into the entry boxes below it
+# ----------------------------------------------------------------------------
+
+def _apply(prefix, info, isin, targets):
+    """Write fetched values into the widgets named in `targets` (called from a button callback)."""
+    cmin = targets["cmin"]
+    ss[targets["cpn"]] = float(min(max(info.coupon, cmin), 25.0))
+    ss[targets["mat"]] = min(max(info.maturity, DMIN), DMAX)
+    if targets.get("name") is not None:
+        ss[targets["name"]] = isin
+    src = f" from {info.source}" if info.source else " from the text you pasted"
+    ss[f"{prefix}_msg"] = ("ok", f"Filled coupon {info.coupon:.2f}% and maturity {info.maturity:%d %b %Y}{src}. "
+                                 "Check them against the bond's term sheet or your broker screen.")
+
+
+def _fetch_cb(prefix, targets):
+    isin = ss.get(f"{prefix}_isin", "").strip().upper()
+    if not fch.valid_isin(isin):
+        ss[f"{prefix}_msg"] = ("err", "That is not a valid Indian ISIN (12 characters starting IN, with a correct check digit).")
+        return
+    res = fch.lookup_isin(isin)
+    if res.best is None:
+        ss[f"{prefix}_msg"] = ("err", "Could not fetch it automatically (" + "; ".join(res.errors[:3]) +
+                                "). Paste the bond page text below, or type the two values.")
+        return
+    _apply(prefix, res.best, isin, targets)
+    if not res.sources_agree:
+        kind, msg = ss[f"{prefix}_msg"]
+        others = "; ".join(f"{b.coupon:.2f}% / {b.maturity:%d %b %Y} ({b.source})" for b in res.found[1:])
+        ss[f"{prefix}_msg"] = ("warn", msg + " WARNING: other pages disagree: " + others)
+
+
+def _paste_cb(prefix, targets):
+    info = fch.parse_bond_text(ss.get(f"{prefix}_paste", ""))
+    isin = ss.get(f"{prefix}_isin", "").strip().upper()
+    if not info.complete:
+        ss[f"{prefix}_msg"] = ("err", "Could not find both a coupon and a maturity date in that text. "
+                                      "Copy the section that shows 'Coupon Rate' and 'Maturity Date'.")
+        return
+    _apply(prefix, info, isin, targets)
+
+
+def lookup_box(prefix, targets):
+    """ISIN field + fetch button + paste-the-page fallback. Values land in the boxes named in targets."""
+    with st.expander("🔎 Fill coupon and maturity automatically from an ISIN", expanded=False):
+        c1, c2 = st.columns([3, 1])
+        c1.text_input("ISIN", key=f"{prefix}_isin", placeholder="e.g. INE530L07AV8")
+        c2.write("")
+        c2.button("Fetch", key=f"{prefix}_go", on_click=_fetch_cb, args=(prefix, targets))
+        st.text_area("If fetching fails: paste the bond's page text here (from IndiaBonds, Groww or your broker app)",
+                     key=f"{prefix}_paste", height=100)
+        st.button("Read pasted text", key=f"{prefix}_readpaste", on_click=_paste_cb, args=(prefix, targets))
+        msg = ss.get(f"{prefix}_msg")
+        if msg:
+            {"ok": st.success, "warn": st.warning, "err": st.error}[msg[0]](msg[1])
+        st.caption("Public bond pages are read on a best-effort basis and can be wrong, outdated or blocked. "
+                   "Always confirm coupon and maturity before you invest.")
+
 with tab1:
     st.markdown(f"Enter the **real coupon and maturity date** of the {L} bonds you plan to buy on "
                 f"**{start:%d %b %Y}**. You get equal amounts in each, sized to give "
                 f"{inr(gross_monthly)} a month.")
     names, cpns, mats = [], [], []
     for j in range(1, L + 1):
+        lookup_box(f"t1_{j}", {"cpn": f"t1_c{j}", "mat": f"t1_m{j}_{start.isoformat()}",
+                               "name": f"t1_n{j}", "cmin": 1.0})
         c1, c2, c3 = st.columns([2, 1, 1])
         names.append(c1.text_input(f"{j}-year bond: name / ISIN (optional)", key=f"t1_n{j}"))
         cpns.append(c2.number_input(f"{j}-year bond: coupon (%)", min_value=1.0, max_value=25.0,
@@ -321,6 +384,7 @@ with tab2:
                "coupon limit, so next year the app knows which ladder year it is.")
 
     st.subheader("2. The bond you are about to buy")
+    lookup_box("t2", {"cpn": "t2_cpn", "mat": "t2_mat", "name": "t2_name", "cmin": 0.5})
     a, b, c, d = st.columns(4)
     on = a.date_input("Purchase date", value=date.today(), min_value=DMIN, max_value=DMAX, key="t2_on")
     new_name = b.text_input("Bond name / ISIN (optional)", key="t2_name")
