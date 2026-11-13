@@ -25,6 +25,12 @@ are about to buy.
    **fresh money**. Coupon above the limit, wrong maturity or a past date are flagged.
 4. After you buy, press **I bought it: add it to my ladder**, then **Save my ladder (CSV)** again.
 
+**Fill coupon and maturity from an ISIN.** Open *🔎 Fill coupon and maturity automatically from an ISIN* above any
+bond entry, type the ISIN and press **Fetch**. The app searches public bond pages, reads the coupon and maturity date and
+fills the boxes below, showing which page it used. If fetching fails (site blocks it, page layout changed), open the bond's
+page yourself, copy the text and paste it into the box, then press **Read pasted text**. There is no free official data feed
+for this, so **always check the values** before investing; a wrong coupon changes the amount the app asks for.
+
 **Plan ahead (tab ③)** shows roughly how much fresh money you need each year at your best-case and a weaker coupon.
 
 The page forgets everything when you close it, so **always save the CSV** after a change.
@@ -35,6 +41,7 @@ The page forgets everything when you close it, so **always save the CSV** after 
 pip install -r requirements.txt
 streamlit run app.py
 python test_ladder.py        # optional: 23 maths tests
+python test_fetcher.py       # optional: 8 parser tests
 ```
 
 Deploy free on [Streamlit Community Cloud](https://share.streamlit.io): push these files to GitHub, then
@@ -46,6 +53,8 @@ select the repo and `app.py`. Keep all files in the same folder.
 |---|---|
 | `app.py` | The Streamlit screens |
 | `ladder.py` | The ladder maths (no Streamlit), easy to test |
+| `fetcher.py` | ISIN check, page-text parser and best-effort web lookup (standard library only) |
+| `test_fetcher.py` | 8 tests for the parser (the live web fetch itself cannot be tested offline) |
 | `test_ladder.py` | 23 tests, including a check that real-date sizing matches the yearly engine |
 
 ## Assumptions
